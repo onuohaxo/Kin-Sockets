@@ -1,11 +1,16 @@
 {
-  "name": "thebeyond-server",
-  "version": "1.0.0",
+  "name": "kin-sockets",
+  "version": "2.0.0",
+  "description": "Godot WebSocket Multiplayer Server",
   "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "ws": "^8.18.0"
-  },
-  "scripts": {
-    "start": "node server.js"
   }
 }
