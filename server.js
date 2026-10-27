@@ -4,10 +4,11 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 8080;
 
 // --- Tune these to your game ---------------------------------------------
+// Units are now Godot 3D units (metres), not pixels.
 const TICK_MS = 50; // Broadcast moves at most 20x/sec, coalesced per tick.
 const MIN_MOVE_INTERVAL_MS = 30; // Drop floods faster than ~33 moves/sec.
-const MOVE_EPSILON = 0.5; // Ignore sub-pixel jitter.
-const MAX_SPEED_PX_PER_SEC = 800; // Your fastest legit player speed. Tune this.
+const MOVE_EPSILON = 0.01; // Ignore sub-centimetre jitter (metres).
+const MAX_SPEED_UNITS_PER_SEC = 20; // Your fastest legit player speed. Tune this.
 const MAX_POSITION = 10000; // World bound. Tune this to your map size.
 const CHAT_MIN_INTERVAL_MS = 500;
 const HEARTBEAT_MS = 30000;
@@ -20,7 +21,7 @@ const wss = new WebSocket.Server({
   maxPayload: 4096,
 });
 
-const players = new Map(); // id -> { id, x, y, vx, vy, lastMoveAt, lastChatAt, hasMoved }
+const players = new Map(); // id -> { id, x, y, z, vx, vy, vz, rotY, lastMoveAt, lastChatAt, hasMoved }
 const sockets = new Map(); // id -> ws (kept separate so player objects stay JSON-safe)
 const dirtyPlayers = new Set(); // ids whose move still needs broadcasting
 
@@ -29,8 +30,11 @@ function publicPlayer(player) {
     id: player.id,
     x: player.x,
     y: player.y,
+    z: player.z,
     vx: player.vx,
     vy: player.vy,
+    vz: player.vz,
+    rot_y: player.rotY,
   };
 }
 
@@ -66,8 +70,6 @@ function clamp(value, min, max) {
 
 // Batched move broadcast: if a client sends 3 moves in one tick, other
 // players now get 1 message (its latest position) instead of 3.
-// At 20 players this turns 20 * 19 * 20 msgs/sec of bursts into
-// at most 20 * 19 msgs per tick, with no duplicate positions.
 const moveTick = setInterval(() => {
   if (dirtyPlayers.size === 0) return;
 
@@ -80,8 +82,11 @@ const moveTick = setInterval(() => {
         id: player.id,
         x: player.x,
         y: player.y,
+        z: player.z,
         vx: player.vx,
         vy: player.vy,
+        vz: player.vz,
+        rot_y: player.rotY,
       },
       sockets.get(playerId)
     );
@@ -117,8 +122,11 @@ wss.on("connection", (ws) => {
     id: playerId,
     x: 0,
     y: 0,
+    z: 0,
     vx: 0,
     vy: 0,
+    vz: 0,
+    rotY: 0,
     lastMoveAt: Date.now(),
     lastChatAt: 0,
     hasMoved: false,
@@ -175,43 +183,53 @@ wss.on("connection", (ws) => {
 
         const x = Number(data.x);
         const y = Number(data.y);
+        // z defaults to 0, so a 2D client sending only x/y still works.
+        const z = data.z === undefined ? 0 : Number(data.z);
         // Number("abc") is NaN and the old `|| 0` turned that into a
         // teleport to (0, 0). Reject non-finite values outright.
-        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
 
         const targetX = clamp(x, -MAX_POSITION, MAX_POSITION);
         const targetY = clamp(y, -MAX_POSITION, MAX_POSITION);
+        const targetZ = clamp(z, -MAX_POSITION, MAX_POSITION);
 
         let finalX = targetX;
         let finalY = targetY;
+        let finalZ = targetZ;
 
         if (current.hasMoved) {
-          // Speed check: clamp impossible movement instead of trusting
-          // the client. The +10px slack absorbs lag and rounding.
+          // Speed check in 3D: clamp impossible movement instead of
+          // trusting the client. The +0.5 m slack absorbs lag/rounding.
           const dtSec = Math.max((now - current.lastMoveAt) / 1000, 0.001);
           const dx = targetX - current.x;
           const dy = targetY - current.y;
-          const dist = Math.hypot(dx, dy);
-          const maxDist = MAX_SPEED_PX_PER_SEC * dtSec + 10;
+          const dz = targetZ - current.z;
+          const dist = Math.hypot(dx, dy, dz);
+          const maxDist = MAX_SPEED_UNITS_PER_SEC * dtSec + 0.5;
           if (dist > maxDist) {
             finalX = current.x + (dx / dist) * maxDist;
             finalY = current.y + (dy / dist) * maxDist;
+            finalZ = current.z + (dz / dist) * maxDist;
           }
-          // Sub-pixel jitter: don't mark the player dirty, so the
+          // Sub-centimetre jitter: don't mark the player dirty, so the
           // tick has nothing to broadcast.
-          if (Math.hypot(finalX - current.x, finalY - current.y) < MOVE_EPSILON) {
+          if (Math.hypot(finalX - current.x, finalY - current.y, finalZ - current.z) < MOVE_EPSILON) {
             return;
           }
         }
 
         current.x = finalX;
         current.y = finalY;
-        // Forward velocity so Godot clients can interpolate. Extra
-        // fields are ignored by old clients, so this is backwards
-        // compatible. Never trust data.id: the id always comes from
-        // this connection (playerId), not from the client.
-        current.vx = clamp(Number(data.vx) || 0, -MAX_SPEED_PX_PER_SEC, MAX_SPEED_PX_PER_SEC);
-        current.vy = clamp(Number(data.vy) || 0, -MAX_SPEED_PX_PER_SEC, MAX_SPEED_PX_PER_SEC);
+        current.z = finalZ;
+        // Forward velocity + yaw so Godot clients can interpolate and
+        // face the right way. Extra fields are ignored by old clients.
+        // Never trust data.id: the id always comes from this
+        // connection (playerId), not from the client.
+        current.vx = clamp(Number(data.vx) || 0, -MAX_SPEED_UNITS_PER_SEC, MAX_SPEED_UNITS_PER_SEC);
+        current.vy = clamp(Number(data.vy) || 0, -MAX_SPEED_UNITS_PER_SEC, MAX_SPEED_UNITS_PER_SEC);
+        current.vz = clamp(Number(data.vz) || 0, -MAX_SPEED_UNITS_PER_SEC, MAX_SPEED_UNITS_PER_SEC);
+        const rotY = Number(data.rot_y);
+        current.rotY = Number.isFinite(rotY) ? rotY : current.rotY;
         current.lastMoveAt = now;
         current.hasMoved = true;
         dirtyPlayers.add(playerId);
